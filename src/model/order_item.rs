@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use chrono::{Duration, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::{Deserialize, Serialize};
 
 use crate::define_map;
@@ -12,11 +12,21 @@ pub struct OrderItem {
     pub id: OrderItemId,
     pub demand: i32,
     pub creation_time: NaiveTime,
-    pub committed_completion_time: NaiveTime,
+    pub(super) committed_completion_time: NaiveTime,
     pub load_time: Duration,
     pub unload_time: Duration,
     pub pickup_id: FactoryId,
     pub delivery_id: FactoryId,
+}
+
+impl OrderItem {
+    pub fn committed_completion_time(&self, date: NaiveDate) -> NaiveDateTime {
+        let mut date_time = date.and_time(self.committed_completion_time);
+        if self.creation_time > self.committed_completion_time {
+            date_time += Duration::days(1);
+        }
+        date_time
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]

@@ -10,7 +10,7 @@ use crate::define_map;
 use super::{read_csv, MapType};
 
 #[derive(Clone, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FactoryId(String);
+pub struct FactoryId(pub String);
 
 impl Debug for FactoryId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -88,12 +88,10 @@ pub enum SimulatorEventData {
         factory_id: FactoryId,
         work: LoadUnloadWork,
     },
-    DockAvailable {
-        factory_id: FactoryId,
-    },
     FinishLoading {
         vehicle_id: VehicleId,
         factory_id: FactoryId,
+        delivered_items: Vec<OrderItemId>,
     },
     UpdateTimestep,
 }

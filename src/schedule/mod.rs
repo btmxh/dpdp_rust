@@ -1,7 +1,5 @@
 pub mod naive;
 
-use std::collections::HashMap;
-
 use chrono::NaiveDateTime;
 
 use crate::{

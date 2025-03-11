@@ -1,5 +1,4 @@
 use chrono::NaiveDateTime;
-use rand::seq::IndexedRandom;
 
 use crate::{
     model::{
@@ -36,9 +35,9 @@ impl Scheduler for NaiveScheduler {
     fn schedule(
         &mut self,
         unallocated_order_items: OrderItemMap,
-        ongoing_order_items: OrderItemMap,
+        _ongoing_order_items: OrderItemMap,
         vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
-        time: NaiveDateTime,
+        _time: NaiveDateTime,
     ) -> MapType<VehicleId, Vec<VehicleRoute>> {
         let mut schedule = MapType::new();
         for (vid, items) in vehicle_stacks {
@@ -72,7 +71,7 @@ impl Scheduler for NaiveScheduler {
             let delivery_id = items.first().unwrap().delivery_id.clone();
 
             for item in items {
-                if total_demand + item.demand > vehicle_info.capacity {
+                if total_demand + item.demand > vehicle_info.capacity() {
                     let plan = schedule.entry(vid.clone()).or_default();
                     plan.push(VehicleRoute::new(
                         pickup_id.clone(),
@@ -88,7 +87,7 @@ impl Scheduler for NaiveScheduler {
                     (vid, vehicle_info) = current_vehicle_itr.next().unwrap();
                 }
 
-                assert!(item.demand < vehicle_info.capacity);
+                assert!(item.demand < vehicle_info.capacity());
                 pending_items.push(item.id);
                 total_demand += item.demand;
             }

@@ -10,7 +10,7 @@ use crate::define_map;
 use super::{read_csv, MapType};
 
 #[derive(Clone, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VehicleId(String);
+pub struct VehicleId(pub String);
 
 impl Debug for VehicleId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +27,7 @@ impl Display for VehicleId {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VehicleInfo {
     pub car_num: VehicleId,
-    pub capacity: i32,
+    capacity: i32,
     pub operation_time: i32,
     pub gps_id: String,
 }
@@ -43,6 +43,13 @@ impl VehicleInfo {
 
     pub fn load_instance(inst: i32) -> anyhow::Result<VehicleInfoMap> {
         Self::load(format!("data/benchmark/instance_{}/vehicle_info.csv", inst))
+    }
+
+    // in the data files, capacity is in standard pallet
+    // but in our implementation, we measure demand in boxes (1/4 standard pallet)
+    // therefore the capacity is multiplied by 4
+    pub fn capacity(&self) -> i32 {
+        self.capacity * 4
     }
 }
 

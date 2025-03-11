@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context as _};
+use humantime::format_duration;
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
+    time::Instant,
 };
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use rand::{seq::IndexedRandom, Rng};
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use rand::{rngs::SmallRng, seq::IndexedRandom, Rng};
 
 use crate::{
     define_map,
@@ -68,7 +70,33 @@ pub enum OrderItemState {
     // picked up by a vehicle, yet to be delivered
     PickedUp,
     // delivered
-    Delivered,
+    Delivered {
+        deadline: NaiveDateTime,
+        deliver_time: NaiveDateTime,
+    },
+}
+
+impl OrderItemState {
+    pub fn delivered(from: NaiveDateTime, to: NaiveDateTime) -> Self {
+        Self::Delivered {
+            deadline: from,
+            deliver_time: to,
+        }
+    }
+
+    fn delivered_irrelevant() -> Self {
+        Self::delivered(NaiveDateTime::MAX, NaiveDateTime::MAX)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Self::Delivered {
+                deadline,
+                deliver_time,
+            } => deliver_time.signed_duration_since(*deadline),
+            _ => Duration::zero(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,9 +138,7 @@ impl VehicleState {
     }
 }
 
-pub struct Simulator<RNG> {
-    rng: RefCell<RNG>,
-
+pub struct Simulator {
     routes: RouteMap,
     factories: FactoryInfoMap,
     vehicles: VehicleInfoMap,
@@ -131,10 +157,29 @@ pub struct Simulator<RNG> {
     scheduler: Box<dyn Scheduler>,
 
     events: EventQueue<(SimulatorEventData, NaiveDateTime)>,
+
+    total_distance: f32,
 }
 
-impl<RNG: Rng> Simulator<RNG> {
-    pub fn new(mut rng: RNG, inst_num: i32) -> anyhow::Result<Self> {
+pub enum VehicleInitialPosition<'a, RNG = SmallRng> {
+    Deterministic(MapType<VehicleId, FactoryId>),
+    Random(&'a mut RNG),
+}
+
+impl<'a, RNG: Rng> VehicleInitialPosition<'a, RNG> {
+    pub fn get(&mut self, vehicle_id: &VehicleId, factories: &[FactoryId]) -> FactoryId {
+        match self {
+            Self::Deterministic(map) => map.get(vehicle_id).unwrap().clone(),
+            Self::Random(rng) => factories.choose(rng).unwrap().clone(),
+        }
+    }
+}
+
+impl Simulator {
+    pub fn new<RNG: Rng>(
+        mut initial_position: VehicleInitialPosition<'_, RNG>,
+        inst_num: i32,
+    ) -> anyhow::Result<Self> {
         let orders = Order::load_instance(inst_num).context("unable to load orders")?;
         let order_items: OrderItemMap = orders
             .values()
@@ -145,14 +190,11 @@ impl<RNG: Rng> Simulator<RNG> {
         let vehicles = VehicleInfo::load_instance(inst_num).context("unable to load vehicles")?;
         let factories = FactoryInfo::load_std().context("unable to load factories")?;
         let factory_ids: Vec<_> = factories.keys().cloned().collect();
-        let initial_date = Utc::now().date_naive();
+        let initial_date = Local::now().date_naive();
         let vehicle_states = vehicles
             .keys()
             .map(|id| {
-                let init_pos = factory_ids
-                    .choose(&mut rng)
-                    .expect("should be present")
-                    .clone();
+                let init_pos = initial_position.get(id, &factory_ids);
                 (id.clone(), VehicleState::new(init_pos))
             })
             .collect::<MapType<_, _>>()
@@ -179,14 +221,13 @@ impl<RNG: Rng> Simulator<RNG> {
             ));
         }
 
+        let time_interval = Duration::minutes(10);
         events.push((
             SimulatorEventData::UpdateTimestep,
             initial_date.and_time(NaiveTime::MIN),
         ));
 
         Ok(Self {
-            rng: RefCell::new(rng),
-
             routes: RouteInfo::load_std()
                 .context("unable to load routes")?
                 .into(),
@@ -196,7 +237,7 @@ impl<RNG: Rng> Simulator<RNG> {
             order_items,
 
             initial_date,
-            time_interval: Duration::minutes(10),
+            time_interval,
 
             vehicle_states,
             factory_states,
@@ -208,6 +249,7 @@ impl<RNG: Rng> Simulator<RNG> {
             ),
 
             dock_approaching_time: Duration::minutes(30),
+            total_distance: 0.0,
         })
     }
 
@@ -216,7 +258,7 @@ impl<RNG: Rng> Simulator<RNG> {
     }
 
     pub fn simulate_until(&mut self, until: NaiveDateTime) {
-        while self.events.peek().map(|e| e.1 < until).unwrap_or(false) {
+        while self.events.peek().map(|e| e.1 <= until).unwrap_or(false) {
             self.simulate_step();
         }
     }
@@ -244,13 +286,11 @@ impl<RNG: Rng> Simulator<RNG> {
                 factory_id,
                 work,
             } => self.handle_vehicle_approached_dock(vehicle_id, factory_id, work, time),
-            SimulatorEventData::DockAvailable { factory_id } => {
-                self.handle_dock_available(factory_id, time)
-            }
             SimulatorEventData::FinishLoading {
                 vehicle_id,
                 factory_id,
-            } => self.handle_finish_load(vehicle_id, factory_id, time),
+                delivered_items,
+            } => self.handle_finish_load(vehicle_id, factory_id, delivered_items, time),
             SimulatorEventData::UpdateTimestep => {
                 self.handle_timestep(time);
             }
@@ -266,11 +306,12 @@ impl<RNG: Rng> Simulator<RNG> {
     ) {
         let state = self.vehicle_states.gets_mut(&vehicle_id);
         assert!(matches!(&state.position, VehiclePosition::DoingWork(pos) if pos == &factory_id));
+        let mut delivered_items = vec![];
         // ensure LIFO constraints
         while let Some(item) = work.unload_items.pop() {
             let corresponding_item = state.item_stack.pop();
-            *self.order_item_states.gets_mut(&item) = OrderItemState::Delivered;
-            assert!(corresponding_item == Some(item));
+            assert!(corresponding_item.as_ref() == Some(&item));
+            delivered_items.push(item);
         }
         for item in work.load_items.iter() {
             *self.order_item_states.gets_mut(item) = OrderItemState::PickedUp;
@@ -282,12 +323,13 @@ impl<RNG: Rng> Simulator<RNG> {
             .map(|i| self.order_items.gets(i).demand)
             .sum();
         // ensure capacity constraints
-        assert!(total_demand <= self.vehicles.gets(&vehicle_id).capacity);
+        assert!(total_demand <= self.vehicles.gets(&vehicle_id).capacity());
         let total_time = work.load_time + work.unload_time;
         self.events.push((
             SimulatorEventData::FinishLoading {
                 vehicle_id,
                 factory_id,
+                delivered_items,
             },
             time + total_time,
         ));
@@ -310,12 +352,14 @@ impl<RNG: Rng> Simulator<RNG> {
             .query_time(factory_id.clone(), route.destination.clone());
         let state = self.vehicle_states.gets_mut(&vehicle_id);
         assert!(matches!(&state.position, VehiclePosition::Idle(pos) if pos == &factory_id));
+        self.total_distance += self
+            .routes
+            .query_distance(factory_id.clone(), route.destination.clone());
         state.position = VehiclePosition::Transporting(factory_id, route.destination.clone());
 
         // simulate loading and unloading ahead of time
         for unload_item in route.work.unload_items.iter().rev() {
             let item = state.allocated_item_stack.pop();
-            println!("{item:?} {unload_item:?}");
             assert!(item.as_ref() == Some(unload_item));
         }
         state
@@ -332,12 +376,8 @@ impl<RNG: Rng> Simulator<RNG> {
         ));
     }
 
-    fn total_demand(&self, state: &VehicleState) -> i32 {
-        state
-            .item_stack
-            .iter()
-            .map(|i| self.order_items.gets(i).demand)
-            .sum()
+    fn total_demand(&self, items: &[OrderItemId]) -> i32 {
+        items.iter().map(|i| self.order_items.gets(i).demand).sum()
     }
 
     fn check_order_split(&self, item_ids: &[OrderItemId], capacity: i32) -> anyhow::Result<()> {
@@ -380,13 +420,13 @@ impl<RNG: Rng> Simulator<RNG> {
                 .get(vehicle_id)
                 .ok_or_else(|| anyhow!("Invalid vehicle ID: {}", vehicle_id))?;
 
-            let mut total_demand = self.total_demand(state);
+            let mut total_demand = self.total_demand(&state.allocated_item_stack);
             let mut item_stack = state.allocated_item_stack.clone();
-            assert!(total_demand <= info.capacity);
+            assert!(total_demand <= info.capacity());
             let mut item_states = self.order_item_states.clone();
             for route in routes {
                 total_demand += route.delta_demand(&self.order_items);
-                if total_demand > info.capacity {
+                if total_demand > info.capacity() {
                     return Err(anyhow!(
                         "Violate capacity constraint on vehicle {}!",
                         vehicle_id
@@ -426,7 +466,7 @@ impl<RNG: Rng> Simulator<RNG> {
                         ));
                     }
 
-                    *item_state = OrderItemState::Delivered;
+                    *item_state = OrderItemState::delivered_irrelevant();
                 }
 
                 item_stack.reserve(route.work.load_items.len());
@@ -454,8 +494,8 @@ impl<RNG: Rng> Simulator<RNG> {
                     *item_state = OrderItemState::PickedUp;
                 }
 
-                self.check_order_split(&route.work.load_items, info.capacity)?;
-                self.check_order_split(&route.work.unload_items, info.capacity)?;
+                self.check_order_split(&route.work.load_items, info.capacity())?;
+                self.check_order_split(&route.work.unload_items, info.capacity())?;
             }
         }
 
@@ -473,7 +513,8 @@ impl<RNG: Rng> Simulator<RNG> {
             .order_item_states
             .iter()
             .filter(|(_, state)| {
-                state != &&OrderItemState::Unallocated && state != &&OrderItemState::Delivered
+                state != &&OrderItemState::Unallocated
+                    && !matches!(state, OrderItemState::Delivered { .. })
             })
             .map(|(id, _)| (id.clone(), self.order_items.gets(id).clone()))
             .collect::<MapType<_, _>>();
@@ -483,17 +524,21 @@ impl<RNG: Rng> Simulator<RNG> {
             .map(|(id, state)| (id.clone(), state.allocated_item_stack.clone()))
             .collect::<MapType<_, _>>();
 
-        // println!("unallocated order items: {unallocated_order_items:#?}");
-        // println!("ongoing order items: {ongoing_order_items:#?}");
-        println!("vehicle stacks: {vehicle_stacks:#?}");
+        let start = Instant::now();
         let planned_routes = self.scheduler.schedule(
             unallocated_order_items.into(),
             ongoing_order_items.into(),
             vehicle_stacks,
             time,
         );
-
-        println!("planned routes: {planned_routes:#?}");
+        let schedule_time = start.elapsed();
+        let intervals =
+            1 + (schedule_time.as_nanos() / self.time_interval.to_std().unwrap().as_nanos()) as i32;
+        println!(
+            "scheduling time: {}ms ({} intervals)",
+            format_duration(schedule_time),
+            intervals
+        );
 
         if let Err(err) = self.check_planned_routes(&planned_routes) {
             panic!("invalid planning routes: {}", err);
@@ -511,10 +556,35 @@ impl<RNG: Rng> Simulator<RNG> {
             }
         }
 
-        self.events.push((
-            SimulatorEventData::UpdateTimestep,
-            time + self.time_interval,
-        ));
+        if let Some((item, _)) = self
+            .order_item_states
+            .iter()
+            .find(|(_, s)| !matches!(s, OrderItemState::Delivered { .. }))
+        {
+            println!("{item} is not delivered yet, continuing simulation");
+            self.events.push((
+                SimulatorEventData::UpdateTimestep,
+                time + self.time_interval * intervals,
+            ));
+        } else {
+            let mut order_timeouts: MapType<OrderId, Duration> = Default::default();
+            for (item, state) in self.order_item_states.iter() {
+                let timeout = order_timeouts
+                    .entry(item.order_id.clone())
+                    .or_insert(Duration::MIN);
+                let max_timeout = (*timeout).max(state.timeout());
+                *timeout = max_timeout;
+            }
+            let total_timeout: Duration = order_timeouts
+                .values()
+                .map(|t| (*t).max(Duration::zero()))
+                .sum();
+            let total_timeout_str = format_duration(total_timeout.to_std().unwrap());
+            let total_distance = self.total_distance;
+            println!(
+                "all items are delivered, total timeout {total_timeout_str} ({total_timeout}), total distance {total_distance}"
+            );
+        }
     }
 
     fn handle_order_arrival(
@@ -536,7 +606,6 @@ impl<RNG: Rng> Simulator<RNG> {
         time: NaiveDateTime,
     ) {
         let state = self.vehicle_states.gets_mut(&vehicle_id);
-        println!("current state of {vehicle_id} is {state:?}");
         assert!(
             matches!(&state.position, VehiclePosition::Transporting(_, dest) if dest == &factory_id)
         );
@@ -561,6 +630,7 @@ impl<RNG: Rng> Simulator<RNG> {
     ) {
         let state = self.factory_states.gets_mut(&factory_id);
         if state.num_avail_docks == 0 {
+            println!("factory {factory_id} is full, waiting...");
             state.queue.push_back((vehicle_id, work));
         } else {
             state.num_avail_docks -= 1;
@@ -568,21 +638,28 @@ impl<RNG: Rng> Simulator<RNG> {
         }
     }
 
-    fn handle_dock_available(&mut self, factory_id: FactoryId, time: NaiveDateTime) {
-        let state = self.factory_states.gets_mut(&factory_id);
-        if let Some((vehicle_id, work)) = state.queue.pop_front() {
-            assert!(state.num_avail_docks == 0);
-            self.begin_vehicle_loading(vehicle_id, factory_id, work, time);
-        } else {
-            state.num_avail_docks += 1;
-        }
-    }
     fn handle_finish_load(
         &mut self,
         vehicle_id: VehicleId,
         factory_id: FactoryId,
+        delivered_items: Vec<OrderItemId>,
         time: NaiveDateTime,
     ) {
+        let factory = self.factory_states.gets_mut(&factory_id);
+        if let Some((vehicle_id, work)) = factory.queue.pop_front() {
+            self.begin_vehicle_loading(vehicle_id, factory_id.clone(), work, time);
+        } else {
+            factory.num_avail_docks += 1;
+        }
+
+        for item in delivered_items.iter() {
+            let item_info = self.order_items.gets(item);
+            *self.order_item_states.gets_mut(item) = OrderItemState::delivered(
+                item_info.committed_completion_time(self.initial_date),
+                time,
+            );
+        }
+
         let state = self.vehicle_states.gets_mut(&vehicle_id);
         assert!(matches!(&state.position, VehiclePosition::DoingWork(pos) if pos == &factory_id));
         state.position = VehiclePosition::Idle(factory_id.clone());

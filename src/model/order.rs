@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use chrono::{Duration, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::Deserialize;
 
 use crate::define_map;
@@ -39,7 +39,7 @@ pub struct Order {
     #[serde(deserialize_with = "super::parse_naive_time")]
     pub creation_time: NaiveTime,
     #[serde(deserialize_with = "super::parse_naive_time")]
-    pub committed_completion_time: NaiveTime,
+    committed_completion_time: NaiveTime,
     #[serde(deserialize_with = "super::parse_duration")]
     pub load_time: Duration,
     #[serde(deserialize_with = "super::parse_duration")]
@@ -49,6 +49,14 @@ pub struct Order {
 }
 
 impl Order {
+    pub fn committed_completion_time(&self, date: NaiveDate) -> NaiveDateTime {
+        let mut date_time = date.and_time(self.committed_completion_time);
+        if self.creation_time > self.committed_completion_time {
+            date_time += Duration::days(1);
+        }
+        date_time
+    }
+
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<OrderMap> {
         Ok(read_csv::<Order>(path)?
             .into_iter()
