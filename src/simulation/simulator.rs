@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Context as _};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
-    mem::swap,
+    collections::{HashSet, VecDeque},
 };
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -369,7 +368,7 @@ impl<RNG: Rng> Simulator<RNG> {
 
     fn check_planned_routes(
         &self,
-        planned_routes: &HashMap<VehicleId, Vec<VehicleRoute>>,
+        planned_routes: &MapType<VehicleId, Vec<VehicleRoute>>,
     ) -> anyhow::Result<()> {
         for (vehicle_id, routes) in planned_routes {
             let info = self

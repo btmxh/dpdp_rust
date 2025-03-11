@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::NaiveDateTime;
 use rand::seq::IndexedRandom;
 
@@ -41,8 +39,8 @@ impl Scheduler for NaiveScheduler {
         ongoing_order_items: OrderItemMap,
         vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
         time: NaiveDateTime,
-    ) -> HashMap<VehicleId, Vec<VehicleRoute>> {
-        let mut schedule = HashMap::new();
+    ) -> MapType<VehicleId, Vec<VehicleRoute>> {
+        let mut schedule = MapType::new();
         for (vid, items) in vehicle_stacks {
             let plan: &mut Vec<VehicleRoute> = schedule.entry(vid).or_default();
             for item_id in items.into_iter() {
@@ -54,7 +52,7 @@ impl Scheduler for NaiveScheduler {
             }
         }
 
-        let mut orders: HashMap<OrderId, Vec<OrderItem>> = HashMap::new();
+        let mut orders: MapType<OrderId, Vec<OrderItem>> = MapType::new();
         for (_, item) in unallocated_order_items {
             orders
                 .entry(item.id.order_id.clone())

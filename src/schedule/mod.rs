@@ -20,10 +20,10 @@ pub trait Scheduler {
         ongoing_order_items: OrderItemMap,
         vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
         time: NaiveDateTime,
-    ) -> HashMap<VehicleId, Vec<VehicleRoute>>;
+    ) -> MapType<VehicleId, Vec<VehicleRoute>>;
 }
 
-pub fn deduplicate(plans: &mut HashMap<VehicleId, Vec<VehicleRoute>>) {
+pub fn deduplicate(plans: &mut MapType<VehicleId, Vec<VehicleRoute>>) {
     for plan in plans.values_mut() {
         let old_plan = std::mem::take(plan);
         for route in old_plan {
