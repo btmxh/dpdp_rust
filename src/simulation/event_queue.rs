@@ -10,6 +10,7 @@ pub trait Event {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct EventWrapper<E: Event>(E);
 
 impl<E: Event> PartialEq for EventWrapper<E> {
@@ -31,6 +32,7 @@ impl<E: Event> Ord for EventWrapper<E> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct EventQueue<E: Event> {
     events: BinaryHeap<EventWrapper<E>>,
 }

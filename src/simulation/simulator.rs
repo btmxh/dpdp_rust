@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context as _};
 use humantime::format_duration;
+use serde::Serialize;
 use std::{
-    cell::RefCell,
     collections::{HashSet, VecDeque},
     time::Instant,
 };
@@ -19,22 +19,23 @@ use crate::{
         vehicle_info::{VehicleId, VehicleInfo, VehicleInfoMap},
         Map, MapType,
     },
-    schedule::{naive::NaiveScheduler, Scheduler},
+    schedule::{naive::NaiveScheduler, noop::NoopScheduler, Scheduler, SchedulerArgs},
 };
 
 use super::{
+    callback::SimulationCallback,
     event_queue::EventQueue,
-    sim_event::{LoadUnloadWork, SimulatorEventData},
+    sim_event::{SimulatorEventData, VehicleWork},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VehicleRoute {
     pub destination: FactoryId,
-    pub work: LoadUnloadWork,
+    pub work: VehicleWork,
 }
 
 impl VehicleRoute {
-    pub fn new(destination: FactoryId, work: LoadUnloadWork) -> Self {
+    pub fn new(destination: FactoryId, work: VehicleWork) -> Self {
         Self { destination, work }
     }
 
@@ -52,7 +53,7 @@ impl VehicleRoute {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub enum VehiclePosition {
     Idle(FactoryId),
     DoingWork(FactoryId),
@@ -111,7 +112,7 @@ pub struct VehicleState {
 #[derive(Debug, Clone)]
 pub struct FactoryState {
     num_avail_docks: i32,
-    queue: VecDeque<(VehicleId, LoadUnloadWork)>,
+    queue: VecDeque<(VehicleId, VehicleWork)>,
 }
 
 impl FactoryState {
@@ -138,6 +139,8 @@ impl VehicleState {
     }
 }
 
+pub type SimEvent = (SimulatorEventData, NaiveDateTime);
+
 pub struct Simulator {
     routes: RouteMap,
     factories: FactoryInfoMap,
@@ -156,9 +159,11 @@ pub struct Simulator {
 
     scheduler: Box<dyn Scheduler>,
 
-    events: EventQueue<(SimulatorEventData, NaiveDateTime)>,
+    events: EventQueue<SimEvent>,
 
     total_distance: f32,
+    total_distance_last_timeslot: f32,
+    callbacks: Vec<Box<dyn SimulationCallback>>,
 }
 
 pub enum VehicleInitialPosition<'a, RNG = SmallRng> {
@@ -166,7 +171,7 @@ pub enum VehicleInitialPosition<'a, RNG = SmallRng> {
     Random(&'a mut RNG),
 }
 
-impl<'a, RNG: Rng> VehicleInitialPosition<'a, RNG> {
+impl<RNG: Rng> VehicleInitialPosition<'_, RNG> {
     pub fn get(&mut self, vehicle_id: &VehicleId, factories: &[FactoryId]) -> FactoryId {
         match self {
             Self::Deterministic(map) => map.get(vehicle_id).unwrap().clone(),
@@ -179,6 +184,7 @@ impl Simulator {
     pub fn new<RNG: Rng>(
         mut initial_position: VehicleInitialPosition<'_, RNG>,
         inst_num: i32,
+        callbacks: Vec<Box<dyn SimulationCallback>>,
     ) -> anyhow::Result<Self> {
         let orders = Order::load_instance(inst_num).context("unable to load orders")?;
         let order_items: OrderItemMap = orders
@@ -221,7 +227,7 @@ impl Simulator {
             ));
         }
 
-        let time_interval = Duration::minutes(10);
+        let time_interval = Duration::minutes(100);
         events.push((
             SimulatorEventData::UpdateTimestep,
             initial_date.and_time(NaiveTime::MIN),
@@ -250,6 +256,8 @@ impl Simulator {
 
             dock_approaching_time: Duration::minutes(30),
             total_distance: 0.0,
+            total_distance_last_timeslot: 0.0,
+            callbacks,
         })
     }
 
@@ -271,6 +279,11 @@ impl Simulator {
 
     fn handle_event(&mut self, event_data: SimulatorEventData, time: NaiveDateTime) {
         println!("handling event {event_data:?} at {time}");
+        let sim_event = (event_data, time);
+        self.callbacks
+            .iter_mut()
+            .for_each(|cb| cb.visit_event(&sim_event));
+        let (event_data, time) = sim_event;
         match event_data {
             SimulatorEventData::OrderArrival {
                 order_id,
@@ -301,7 +314,7 @@ impl Simulator {
         &mut self,
         vehicle_id: VehicleId,
         factory_id: FactoryId,
-        mut work: LoadUnloadWork,
+        mut work: VehicleWork,
         time: NaiveDateTime,
     ) {
         let state = self.vehicle_states.gets_mut(&vehicle_id);
@@ -342,7 +355,7 @@ impl Simulator {
         route: VehicleRoute,
         time: NaiveDateTime,
     ) {
-        println!("vehicle {vehicle_id} is following {route:?}");
+        println!("vehicle {vehicle_id} is following {route:?} at {time}");
         route.work.load_items.iter().for_each(|i| {
             *self.order_item_states.gets_mut(i) = OrderItemState::Allocated;
         });
@@ -503,19 +516,13 @@ impl Simulator {
     }
 
     fn handle_timestep(&mut self, time: NaiveDateTime) {
-        let unallocated_order_items = self
+        let distance_travelled = self.total_distance - self.total_distance_last_timeslot;
+
+        self.total_distance_last_timeslot = self.total_distance;
+        let order_items = self
             .order_item_states
             .iter()
-            .filter(|(_, state)| state == &&OrderItemState::Unallocated)
-            .map(|(id, _)| (id.clone(), self.order_items.gets(id).clone()))
-            .collect::<MapType<_, _>>();
-        let ongoing_order_items = self
-            .order_item_states
-            .iter()
-            .filter(|(_, state)| {
-                state != &&OrderItemState::Unallocated
-                    && !matches!(state, OrderItemState::Delivered { .. })
-            })
+            .filter(|(_, state)| state != &&OrderItemState::Unavailable)
             .map(|(id, _)| (id.clone(), self.order_items.gets(id).clone()))
             .collect::<MapType<_, _>>();
         let vehicle_stacks = self
@@ -523,19 +530,38 @@ impl Simulator {
             .iter()
             .map(|(id, state)| (id.clone(), state.allocated_item_stack.clone()))
             .collect::<MapType<_, _>>();
+        let vehicle_positions = self
+            .vehicle_states
+            .iter()
+            .map(|(id, state)| (id.clone(), state.position.clone()))
+            .collect::<MapType<_, _>>();
 
         let start = Instant::now();
-        let planned_routes = self.scheduler.schedule(
-            unallocated_order_items.into(),
-            ongoing_order_items.into(),
+        let sim = self.fork(Box::new(NoopScheduler), Some(time));
+        // let args = SchedulerArgs::new(sim);
+        let args = SchedulerArgs {
+            items: order_items.into(),
+            item_states: self.order_item_states.clone(),
             vehicle_stacks,
+            vehicle_positions,
             time,
-        );
+            elapsed_distance: distance_travelled,
+            static_simulator: sim,
+        };
+        self.callbacks
+            .iter_mut()
+            .for_each(|cb| cb.visit_dispatch_input(&args));
+        let planned_routes = self.scheduler.schedule(args);
+        self.callbacks
+            .iter_mut()
+            .for_each(|cb| cb.visit_dispatch_output(&planned_routes));
+        println!("planned route: {:?}", planned_routes);
+
         let schedule_time = start.elapsed();
         let intervals =
             1 + (schedule_time.as_nanos() / self.time_interval.to_std().unwrap().as_nanos()) as i32;
         println!(
-            "scheduling time: {}ms ({} intervals)",
+            "scheduling time: {} ({} intervals)",
             format_duration(schedule_time),
             intervals
         );
@@ -568,12 +594,20 @@ impl Simulator {
             ));
         } else {
             let mut order_timeouts: MapType<OrderId, Duration> = Default::default();
+            let mut order_deliver_times: MapType<OrderId, NaiveDateTime> = Default::default();
             for (item, state) in self.order_item_states.iter() {
                 let timeout = order_timeouts
                     .entry(item.order_id.clone())
                     .or_insert(Duration::MIN);
                 let max_timeout = (*timeout).max(state.timeout());
                 *timeout = max_timeout;
+                let order_deliver_time = order_deliver_times
+                    .entry(item.order_id.clone())
+                    .or_insert(NaiveDateTime::MIN);
+                if let OrderItemState::Delivered { deliver_time, .. } = state {
+                    let max_deliver_time = (*order_deliver_time).max(*deliver_time);
+                    *order_deliver_time = max_deliver_time;
+                }
             }
             let total_timeout: Duration = order_timeouts
                 .values()
@@ -581,6 +615,22 @@ impl Simulator {
                 .sum();
             let total_timeout_str = format_duration(total_timeout.to_std().unwrap());
             let total_distance = self.total_distance;
+            for (order_id, timeout) in order_timeouts {
+                let deliver_time = order_deliver_times
+                    .get(&order_id)
+                    .unwrap()
+                    .and_local_timezone(Local)
+                    .unwrap()
+                    .timestamp();
+                let deadline = self
+                    .orders
+                    .gets(&order_id)
+                    .committed_completion_time(self.initial_date)
+                    .and_local_timezone(Local)
+                    .unwrap()
+                    .timestamp();
+                println!("{order_id} timeout: {timeout} ({deliver_time} - {deadline})");
+            }
             println!(
                 "all items are delivered, total timeout {total_timeout_str} ({total_timeout}), total distance {total_distance}"
             );
@@ -602,7 +652,7 @@ impl Simulator {
         &mut self,
         vehicle_id: VehicleId,
         factory_id: FactoryId,
-        work: LoadUnloadWork,
+        work: VehicleWork,
         time: NaiveDateTime,
     ) {
         let state = self.vehicle_states.gets_mut(&vehicle_id);
@@ -625,7 +675,7 @@ impl Simulator {
         &mut self,
         vehicle_id: VehicleId,
         factory_id: FactoryId,
-        work: LoadUnloadWork,
+        work: VehicleWork,
         time: NaiveDateTime,
     ) {
         let state = self.factory_states.gets_mut(&factory_id);
@@ -652,11 +702,17 @@ impl Simulator {
             factory.num_avail_docks += 1;
         }
 
+        println!("{delivered_items:?} are delivered");
+        let unload_time: Duration = delivered_items
+            .iter()
+            .map(|id| self.order_items.gets(id).unload_time)
+            .sum();
+
         for item in delivered_items.iter() {
             let item_info = self.order_items.gets(item);
             *self.order_item_states.gets_mut(item) = OrderItemState::delivered(
                 item_info.committed_completion_time(self.initial_date),
-                time,
+                time - self.dock_approaching_time - unload_time,
             );
         }
 
@@ -666,6 +722,43 @@ impl Simulator {
 
         if let Some(dest) = state.current_route.pop_front() {
             self.begin_vehicle_transporting(vehicle_id, factory_id, dest, time);
+        }
+    }
+
+    pub fn fork(
+        &self,
+        scheduler: Box<dyn Scheduler>,
+        static_deadline: Option<NaiveDateTime>,
+    ) -> Self {
+        let mut orders = self.orders.clone();
+        let mut order_items = self.order_items.clone();
+
+        if let Some(static_deadline) = static_deadline {
+            orders.retain(|_, order| {
+                self.initial_date.and_time(order.creation_time) <= static_deadline
+            });
+            order_items.retain(|_, item| {
+                self.initial_date.and_time(item.creation_time) <= static_deadline
+            });
+        }
+
+        Self {
+            routes: self.routes.clone(),
+            factories: self.factories.clone(),
+            vehicles: self.vehicles.clone(),
+            orders,
+            order_items,
+            initial_date: self.initial_date.clone(),
+            time_interval: self.time_interval.clone(),
+            vehicle_states: self.vehicle_states.clone(),
+            factory_states: self.factory_states.clone(),
+            order_item_states: self.order_item_states.clone(),
+            dock_approaching_time: self.dock_approaching_time.clone(),
+            scheduler,
+            events: self.events.clone(),
+            total_distance: self.total_distance.clone(),
+            total_distance_last_timeslot: self.total_distance_last_timeslot.clone(),
+            callbacks: self.callbacks.clone(),
         }
     }
 }

@@ -1,4 +1,5 @@
 use chrono::{Duration, NaiveDateTime};
+use serde::Serialize;
 
 use crate::model::{
     factory_info::FactoryId,
@@ -10,15 +11,15 @@ use crate::model::{
 
 use super::event_queue::Event;
 
-#[derive(Debug, Clone)]
-pub struct LoadUnloadWork {
+#[derive(Debug, Clone, Serialize)]
+pub struct VehicleWork {
     pub load_items: Vec<OrderItemId>,
     pub unload_items: Vec<OrderItemId>,
     pub load_time: Duration,
     pub unload_time: Duration,
 }
 
-impl LoadUnloadWork {
+impl VehicleWork {
     pub fn new(
         order_items: &OrderItemMap,
         pickup_items: Vec<OrderItemId>,
@@ -63,7 +64,7 @@ impl LoadUnloadWork {
                 .sum::<i32>()
     }
 
-    pub fn merge(&mut self, work: LoadUnloadWork) {
+    pub fn merge(&mut self, work: VehicleWork) {
         self.load_items.extend(work.load_items);
         self.unload_items.extend(work.unload_items);
         self.load_time += work.load_time;
@@ -72,7 +73,7 @@ impl LoadUnloadWork {
 }
 
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SimulatorEventData {
     OrderArrival {
         order_id: OrderId,
@@ -81,12 +82,12 @@ pub enum SimulatorEventData {
     VehicleArrival {
         vehicle_id: VehicleId,
         factory_id: FactoryId,
-        work: LoadUnloadWork,
+        work: VehicleWork,
     },
     VehicleApproachedDock {
         vehicle_id: VehicleId,
         factory_id: FactoryId,
-        work: LoadUnloadWork,
+        work: VehicleWork,
     },
     FinishLoading {
         vehicle_id: VehicleId,

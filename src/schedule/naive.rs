@@ -1,16 +1,17 @@
-use chrono::NaiveDateTime;
-
 use crate::{
     model::{
         order::{Order, OrderId},
-        order_item::{OrderItem, OrderItemId, OrderItemMap},
+        order_item::{OrderItem, OrderItemMap},
         vehicle_info::{VehicleId, VehicleInfo, VehicleInfoMap},
         Map, MapType,
     },
-    simulation::{sim_event::LoadUnloadWork, simulator::VehicleRoute},
+    simulation::{
+        sim_event::VehicleWork,
+        simulator::{OrderItemState, VehicleRoute},
+    },
 };
 
-use super::{deduplicate, Scheduler};
+use super::{deduplicate, Scheduler, SchedulerArgs};
 
 pub struct NaiveScheduler {
     vehicles: VehicleInfoMap,
@@ -29,16 +30,20 @@ impl NaiveScheduler {
                 .into(),
         })
     }
-}
 
-impl Scheduler for NaiveScheduler {
-    fn schedule(
+    pub fn schedule_opt(
         &mut self,
-        unallocated_order_items: OrderItemMap,
-        _ongoing_order_items: OrderItemMap,
-        vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
-        _time: NaiveDateTime,
+        SchedulerArgs {
+            items,
+            item_states,
+            vehicle_stacks,
+            ..
+        }: SchedulerArgs,
+        allocate: bool,
     ) -> MapType<VehicleId, Vec<VehicleRoute>> {
+        // println all items.id
+        let ids: Vec<_> = items.iter().map(|i| i.0).collect();
+        println!("items: {ids:?}");
         let mut schedule = MapType::new();
         for (vid, items) in vehicle_stacks {
             let plan: &mut Vec<VehicleRoute> = schedule.entry(vid).or_default();
@@ -46,70 +51,94 @@ impl Scheduler for NaiveScheduler {
                 let item = self.order_items.gets(&item_id);
                 plan.push(VehicleRoute::new(
                     item.delivery_id.clone(),
-                    LoadUnloadWork::new_unload(&self.order_items, vec![item_id]),
+                    VehicleWork::new_unload(&self.order_items, vec![item_id]),
                 ));
             }
         }
 
-        let mut orders: MapType<OrderId, Vec<OrderItem>> = MapType::new();
-        for (_, item) in unallocated_order_items {
-            orders
-                .entry(item.id.order_id.clone())
-                .or_default()
-                .push(item);
-        }
+        if allocate {
+            let mut orders: MapType<OrderId, Vec<OrderItem>> = MapType::new();
+            for (item_id, item) in items {
+                if item_states.gets(&item_id) == &OrderItemState::Unallocated {
+                    orders
+                        .entry(item.id.order_id.clone())
+                        .or_default()
+                        .push(item);
+                }
+            }
 
-        let vehicles: Vec<_> = self.vehicles.iter().collect();
-        let mut current_vehicle_itr = vehicles.into_iter().cycle();
-        let (mut vid, mut vehicle_info) = current_vehicle_itr.next().unwrap();
+            let vehicles: Vec<_> = self.vehicles.iter().map(|(_, v)| v).collect();
+            let capacity = vehicles[0].capacity();
+            let mut vehicle_idx = 0;
 
-        for (_, items) in orders {
-            let mut pending_items = vec![];
-            let mut total_demand = 0i32;
+            for (_, items) in orders {
+                let demand: i32 = items.iter().map(|i| i.demand).sum();
+                if demand > capacity {
+                    let mut cur_demand = 0;
+                    let mut tmp_items = Vec::new();
 
-            let pickup_id = items.first().unwrap().pickup_id.clone();
-            let delivery_id = items.first().unwrap().delivery_id.clone();
+                    for item in &items {
+                        if cur_demand + item.demand > capacity {
+                            let plan = schedule
+                                .entry(vehicles[vehicle_idx].car_num.clone())
+                                .or_default();
+                            plan.push(VehicleRoute::new(
+                                item.pickup_id.clone(),
+                                VehicleWork::new_load(&self.order_items, tmp_items.clone()),
+                            ));
+                            plan.push(VehicleRoute::new(
+                                item.delivery_id.clone(),
+                                VehicleWork::new_unload(&self.order_items, tmp_items.clone()),
+                            ));
+                            cur_demand = 0;
+                            tmp_items.clear();
+                        }
 
-            for item in items {
-                if total_demand + item.demand > vehicle_info.capacity() {
-                    let plan = schedule.entry(vid.clone()).or_default();
+                        vehicle_idx = (vehicle_idx + 1) % vehicles.len();
+                        tmp_items.push(item.id.clone());
+                        cur_demand += item.demand;
+                    }
+
+                    if !tmp_items.is_empty() {
+                        let plan = schedule
+                            .entry(vehicles[vehicle_idx].car_num.clone())
+                            .or_default();
+                        plan.push(VehicleRoute::new(
+                            items[0].pickup_id.clone(),
+                            VehicleWork::new_load(&self.order_items, tmp_items.clone()),
+                        ));
+                        plan.push(VehicleRoute::new(
+                            items[0].delivery_id.clone(),
+                            VehicleWork::new_unload(&self.order_items, tmp_items.clone()),
+                        ));
+                    }
+                } else {
+                    let plan = schedule
+                        .entry(vehicles[vehicle_idx].car_num.clone())
+                        .or_default();
+                    let item_ids: Vec<_> = items.iter().map(|i| i.id.clone()).collect();
                     plan.push(VehicleRoute::new(
-                        pickup_id.clone(),
-                        LoadUnloadWork::new_load(&self.order_items, pending_items.clone()),
+                        items.first().unwrap().pickup_id.clone(),
+                        VehicleWork::new_load(&self.order_items, item_ids.clone()),
                     ));
                     plan.push(VehicleRoute::new(
-                        delivery_id.clone(),
-                        LoadUnloadWork::new_unload(&self.order_items, pending_items.clone()),
+                        items.first().unwrap().delivery_id.clone(),
+                        VehicleWork::new_unload(&self.order_items, item_ids.clone()),
                     ));
-
-                    pending_items.clear();
-                    total_demand = 0;
-                    (vid, vehicle_info) = current_vehicle_itr.next().unwrap();
                 }
 
-                assert!(item.demand < vehicle_info.capacity());
-                pending_items.push(item.id);
-                total_demand += item.demand;
-            }
-
-            if !pending_items.is_empty() {
-                let plan = schedule.entry(vid.clone()).or_default();
-                plan.push(VehicleRoute::new(
-                    pickup_id.clone(),
-                    LoadUnloadWork::new_load(&self.order_items, pending_items.clone()),
-                ));
-                plan.push(VehicleRoute::new(
-                    delivery_id.clone(),
-                    LoadUnloadWork::new_unload(&self.order_items, pending_items.clone()),
-                ));
-
-                pending_items.clear();
-                (vid, vehicle_info) = current_vehicle_itr.next().unwrap();
+                vehicle_idx = (vehicle_idx + 1) % vehicles.len();
             }
         }
 
         deduplicate(&mut schedule);
 
         schedule
+    }
+}
+
+impl Scheduler for NaiveScheduler {
+    fn schedule(&mut self, args: SchedulerArgs) -> MapType<VehicleId, Vec<VehicleRoute>> {
+        self.schedule_opt(args, true)
     }
 }

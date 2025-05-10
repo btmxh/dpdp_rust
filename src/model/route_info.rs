@@ -25,12 +25,14 @@ impl RouteInfo {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SingleRoute {
     route_code: String,
     distance: f32,
     time: i64,
 }
 
+#[derive(Debug, Clone)]
 pub struct RouteMap {
     map: MapType<(FactoryId, FactoryId), SingleRoute>,
 }

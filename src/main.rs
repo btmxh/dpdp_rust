@@ -1,5 +1,6 @@
 use chrono::{Duration, Local, NaiveTime};
 use dpdp_rust::{
+    callbacks::log_dispatch::LogDispatchCallback,
     model::{
         factory_info::FactoryId,
         route_info::{RouteInfo, RouteMap},
@@ -25,7 +26,8 @@ fn main() -> anyhow::Result<()> {
             .map(|(vid, fid)| (VehicleId(vid.to_string()), FactoryId(fid.to_string())))
             .into(),
         ),
-        3,
+        1,
+        vec![Box::new(LogDispatchCallback::new("test".into()))],
     )?;
     sim.simulate_until(
         Local::now().date_naive().and_time(NaiveTime::MIN) + Duration::minutes(200000),

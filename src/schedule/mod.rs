@@ -1,6 +1,9 @@
 pub mod naive;
+pub mod noop;
+// pub mod rl;
 
 use chrono::NaiveDateTime;
+use serde::Serialize;
 
 use crate::{
     model::{
@@ -8,18 +11,28 @@ use crate::{
         vehicle_info::VehicleId,
         MapType,
     },
-    simulation::simulator::VehicleRoute,
+    simulation::simulator::{OrderItemStateMap, Simulator, VehiclePosition, VehicleRoute},
 };
 
 pub trait Scheduler {
-    fn schedule(
-        &mut self,
-        unallocated_order_items: OrderItemMap,
-        ongoing_order_items: OrderItemMap,
-        vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
-        time: NaiveDateTime,
-    ) -> MapType<VehicleId, Vec<VehicleRoute>>;
+    fn schedule(&mut self, args: SchedulerArgs) -> MapType<VehicleId, Vec<VehicleRoute>>;
 }
+
+#[derive(Serialize)]
+pub struct SchedulerArgs {
+    #[serde(skip)]
+    pub items: OrderItemMap,
+    #[serde(skip)]
+    pub item_states: OrderItemStateMap,
+    pub vehicle_stacks: MapType<VehicleId, Vec<OrderItemId>>,
+    pub vehicle_positions: MapType<VehicleId, VehiclePosition>,
+    #[serde(skip)]
+    pub static_simulator: Simulator,
+    pub time: NaiveDateTime,
+    pub elapsed_distance: f32,
+}
+
+impl SchedulerArgs {}
 
 pub fn deduplicate(plans: &mut MapType<VehicleId, Vec<VehicleRoute>>) {
     for plan in plans.values_mut() {

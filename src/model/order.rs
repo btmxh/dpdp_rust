@@ -1,17 +1,19 @@
 use std::{
+    collections::btree_map::Entry,
     fmt::{Debug, Display},
     path::Path,
 };
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::Deserialize;
+use serde_json::map::VacantEntry;
 
 use crate::define_map;
 
 use super::{
     factory_info::FactoryId,
     order_item::{OrderItem, OrderItemId, OrderItemType},
-    read_csv, MapType,
+    read_csv, Map, MapType,
 };
 
 #[derive(Clone, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +72,8 @@ impl Order {
     }
 
     fn create_item(&self, typ: OrderItemType, index: i32) -> OrderItem {
+        let load_time = self.load_time * typ.demand() / self.calc_demand();
+        let unload_time = self.unload_time * typ.demand() / self.calc_demand();
         OrderItem {
             id: OrderItemId {
                 order_id: self.order_id.clone(),
@@ -79,8 +83,8 @@ impl Order {
             demand: typ.demand(),
             creation_time: self.creation_time,
             committed_completion_time: self.committed_completion_time,
-            load_time: self.load_time,
-            unload_time: self.unload_time,
+            load_time,
+            unload_time,
             pickup_id: self.pickup_id.clone(),
             delivery_id: self.delivery_id.clone(),
         }
@@ -108,6 +112,28 @@ impl Order {
 }
 
 define_map!(OrderId, Order, OrderMap);
+
+pub fn order_items_grouped_by_order_max<T>(
+    map: impl Iterator<Item = (OrderItemId, T)>,
+) -> MapType<OrderId, T>
+where
+    T: Ord,
+{
+    let mut order_map: MapType<OrderId, T> = MapType::new();
+    for (item_id, item) in map {
+        match order_map.entry(item_id.order_id) {
+            Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert(item);
+            }
+            Entry::Occupied(mut occupied_entry) => {
+                if &item > occupied_entry.get() {
+                    occupied_entry.insert(item);
+                }
+            }
+        }
+    }
+    order_map
+}
 
 #[test]
 fn test_read_all_orders() {

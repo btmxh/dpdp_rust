@@ -111,6 +111,13 @@ where
     fn insert(&mut self, key: K, value: V) {
         self.borrow_mut().insert(key, value);
     }
+
+    fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        self.borrow_mut().retain(f);
+    }
 }
 
 pub type MapType<K, V> = BTreeMap<K, V>;

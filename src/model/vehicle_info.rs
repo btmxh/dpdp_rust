@@ -3,13 +3,13 @@ use std::{
     path::Path,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::define_map;
 
 use super::{read_csv, MapType};
 
-#[derive(Clone, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VehicleId(pub String);
 
 impl Debug for VehicleId {
